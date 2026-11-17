@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from datetime import UTC, datetime
 from typing import Any
@@ -70,12 +71,20 @@ def configure_azure_monitor(settings: Settings, service: str) -> bool:
     from azure.monitor.opentelemetry import configure_azure_monitor as _configure
     from opentelemetry.sdk.resources import Resource
 
+    options: dict[str, Any] = {}
+    if settings.appinsights_entra_auth:
+        from azure.identity import ManagedIdentityCredential
+
+        # AZURE_CLIENT_ID selects the user-assigned identity (set in infra/apps/*.bicep).
+        options["credential"] = ManagedIdentityCredential(client_id=os.getenv("AZURE_CLIENT_ID"))
+
     _configure(
         connection_string=settings.applicationinsights_connection_string.get_secret_value(),
+        **options,
         resource=Resource.create(
             {
+                # service.name becomes AppRoleName (cloud_RoleName), which alerts filter on.
                 "service.name": service,
-                "service.namespace": "tradeops",
                 # Becomes AppVersion in Log Analytics; one value per ACA revision.
                 "service.version": settings.revision,
                 "deployment.environment": settings.environment,

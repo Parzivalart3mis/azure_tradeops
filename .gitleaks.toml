@@ -1,0 +1,5 @@
+# No path or pattern allowlists. The only exceptions are individual lines annotated
+# `gitleaks:allow`: Azurite's published development key (tests, docker-compose) and one
+# built-in Azure role definition id whose variable name contains "Secrets".
+[extend]
+useDefault = true

@@ -1,0 +1,207 @@
+# Continuous integration: every gate that runs before anything is deployed. Runs on every
+# pull request (Azure Repos branch policy) and every push to main. Five jobs in parallel,
+# then the image job, which needs tests and app security to pass first.
+
+jobs:
+  # -----------------------------------------------------------------------------------
+  - job: Python
+    displayName: Python - lint, types, tests
+    steps:
+      - task: UsePythonVersion@0
+        inputs: { versionSpec: $(pythonVersion) }
+
+      - script: pip install --quiet "uv==$(uvVersion)"
+        displayName: Install uv
+
+      - script: docker run -d --name azurite -p 10002:10002 $(azuriteImage) azurite-table --tableHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
+        displayName: Start Azurite (Table Storage emulator)
+
+      - script: |
+          set -euo pipefail
+          uv sync --frozen
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run mypy
+        displayName: Lint and type-check
+        workingDirectory: app
+
+      - script: |
+          uv run pytest -m "" \
+            --junitxml=$(Build.ArtifactStagingDirectory)/test-results-python.xml \
+            --cov --cov-report=xml:$(Build.ArtifactStagingDirectory)/coverage.xml \
+            --cov-fail-under=90
+        displayName: Unit and integration tests (coverage >= 90%)
+        workingDirectory: app
+        env:
+          TRADEOPS_TEST_AZURITE: '1'
+
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.ArtifactStagingDirectory)/test-results-python.xml
+          testRunTitle: Python
+          failTaskOnFailedTests: true
+
+      - task: PublishCodeCoverageResults@2
+        condition: succeededOrFailed()
+        inputs:
+          summaryFileLocation: $(Build.ArtifactStagingDirectory)/coverage.xml
+
+  # -----------------------------------------------------------------------------------
+  - job: AppSecurity
+    displayName: Security - SAST, dependencies, secrets
+    steps:
+      - checkout: self
+        fetchDepth: 0  # secret scanning covers the full history, not just this commit
+
+      - task: UsePythonVersion@0
+        inputs: { versionSpec: $(pythonVersion) }
+
+      - script: pip install --quiet "uv==$(uvVersion)" && uv sync --frozen
+        displayName: Install
+        workingDirectory: app
+
+      - script: |
+          set -euo pipefail
+          mkdir -p $(Build.ArtifactStagingDirectory)/CodeAnalysisLogs
+          uv run bandit -r src -c pyproject.toml -f sarif -o $(Build.ArtifactStagingDirectory)/CodeAnalysisLogs/bandit.sarif --exit-zero
+          uv run bandit -r src -c pyproject.toml --severity-level medium --confidence-level medium
+        displayName: SAST (bandit) - fail on medium+
+        workingDirectory: app
+
+      - script: |
+          set -euo pipefail
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt > /tmp/requirements.txt
+          uv run pip-audit --strict --requirement /tmp/requirements.txt --progress-spinner off
+        displayName: Dependency CVEs (pip-audit)
+        workingDirectory: app
+
+      - script: |
+          set -euo pipefail
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v$(gitleaksVersion)/gitleaks_$(gitleaksVersion)_linux_x64.tar.gz" | tar xz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --redact --verbose \
+            --report-format sarif --report-path $(Build.ArtifactStagingDirectory)/CodeAnalysisLogs/gitleaks.sarif
+        displayName: Secret scanning (gitleaks, full history)
+
+      # The SARIF SAST Scans Tab extension renders the CodeAnalysisLogs artifact.
+      - publish: $(Build.ArtifactStagingDirectory)/CodeAnalysisLogs
+        artifact: CodeAnalysisLogs
+        condition: succeededOrFailed()
+
+  # -----------------------------------------------------------------------------------
+  - job: Infrastructure
+    displayName: Infrastructure - Bicep lint, PSRule, gate self-test
+    steps:
+      - script: |
+          set -euo pipefail
+          az bicep install
+          az bicep version
+          for f in infra/main.bicep infra/apps/api.bicep infra/apps/worker.bicep \
+                   infra/governance/policies.bicep infra/bootstrap/main.bicep; do
+            echo "lint $f"
+            az bicep lint --file "$f"
+          done
+        displayName: Bicep lint (linter rules raised to errors)
+
+      - script: |
+          set -euo pipefail
+          out=$(Build.ArtifactStagingDirectory)/deploy
+          mkdir -p "$out/infra/apps" "$out/infra/env"
+          az bicep build --file infra/main.bicep --outfile "$out/infra/main.json"
+          az bicep build --file infra/apps/api.bicep --outfile "$out/infra/apps/api.json"
+          az bicep build --file infra/apps/worker.bicep --outfile "$out/infra/apps/worker.json"
+          for env in dev staging prod; do
+            az bicep build-params --file "infra/env/$env.bicepparam" --outfile "$out/infra/env/$env.parameters.json"
+          done
+          cp -r scripts "$out/scripts"
+        displayName: Compile templates (build once, deploy the same JSON everywhere)
+
+      - pwsh: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSRule -RequiredVersion $(psRuleVersion) -Scope CurrentUser -Force
+          Install-Module PSRule.Rules.Azure -RequiredVersion $(psRuleAzureVersion) -Scope CurrentUser -Force
+          New-Item -ItemType Directory -Force reports | Out-Null
+          Assert-PSRule -Format File -InputPath infra/ -Module PSRule.Rules.Azure `
+            -OutputFormat NUnit3 -OutputPath reports/ps-rule-results.xml
+        displayName: PSRule for Azure (Well-Architected + TradeOps rules)
+        env:
+          PSRULE_AZURE_BICEP_USE_AZURE_CLI: 'true'
+
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: NUnit
+          testResultsFiles: reports/ps-rule-results.xml
+          testRunTitle: PSRule for Azure
+
+      - pwsh: ./scripts/Test-SecurityGates.ps1 -SummaryPath $(Build.ArtifactStagingDirectory)/security-gates.md
+        displayName: Security gate self-test (unsafe changes must be rejected)
+        env:
+          PSRULE_AZURE_BICEP_USE_AZURE_CLI: 'true'
+
+      - publish: $(Build.ArtifactStagingDirectory)/deploy
+        artifact: deploy
+
+  # -----------------------------------------------------------------------------------
+  - job: PowerShell
+    displayName: PowerShell - analyzer, Pester
+    steps:
+      - pwsh: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion $(pesterVersion) -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -RequiredVersion $(psScriptAnalyzerVersion) -Scope CurrentUser -Force
+        displayName: Install modules
+
+      - pwsh: |
+          $findings = Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1
+          $findings | Format-Table -AutoSize | Out-String -Width 200
+          if ($findings) { throw "$(@($findings).Count) PSScriptAnalyzer finding(s)" }
+        displayName: PSScriptAnalyzer
+
+      - pwsh: |
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'scripts/tests'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'reports/pester-results.xml'
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+        displayName: Pester
+
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: NUnit
+          testResultsFiles: reports/pester-results.xml
+          testRunTitle: Pester
+
+  # -----------------------------------------------------------------------------------
+  - job: Image
+    displayName: Container image - build, scan, SBOM
+    dependsOn: [Python, AppSecurity]
+    steps:
+      - script: |
+          set -euo pipefail
+          docker build app \
+            --build-arg VERSION=$(releaseVersion) \
+            --build-arg GIT_SHA=$(Build.SourceVersion) \
+            --tag $(imageRepository):$(releaseVersion)
+          docker image inspect $(imageRepository):$(releaseVersion) --format 'size={{.Size}} user={{.Config.User}}'
+        displayName: docker build
+
+      - script: |
+          set -euo pipefail
+          mkdir -p $(Build.ArtifactStagingDirectory)/image $(Build.ArtifactStagingDirectory)/sbom
+          scan="docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $(Build.ArtifactStagingDirectory):/out $(trivyImage)"
+          $scan image --format cyclonedx --output /out/sbom/sbom.cdx.json $(imageRepository):$(releaseVersion)
+          $scan image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed --no-progress $(imageRepository):$(releaseVersion)
+        displayName: Trivy - fail on fixable HIGH/CRITICAL CVEs; CycloneDX SBOM
+
+      - script: docker save $(imageRepository):$(releaseVersion) | gzip > $(Build.ArtifactStagingDirectory)/image/tradeops.tar.gz
+        displayName: Save image
+
+      - publish: $(Build.ArtifactStagingDirectory)/image
+        artifact: image
+      - publish: $(Build.ArtifactStagingDirectory)/sbom
+        artifact: sbom

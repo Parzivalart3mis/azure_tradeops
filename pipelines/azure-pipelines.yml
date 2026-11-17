@@ -1,0 +1,134 @@
+# Azure TradeOps: commit-to-production pipeline.
+#
+#   Build ──> Dev ──> Staging ──> Prod plan ──> Prod
+#   tests     deploy    canary      what-if       manual approval
+#   scans     smoke     10% -> 50%  for the       canary 10% -> 50%
+#   gates     (100%)    rollback    approver      rollback
+#
+# Pull requests run only the Build stage (configure it as build validation in the main
+# branch policy; see docs/azure-devops-setup.md). Pushes to main run everything.
+#
+# Failing-release demo: queue a run with "Ship a deliberately failing release to staging".
+# The staging canary fails 30% of orders, canary analysis rejects it at 10% traffic, the
+# release rolls back automatically and the run stops before production.
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    exclude: ['docs/*', '*.md']
+
+# Only GitHub/Bitbucket repos honour this; Azure Repos uses branch-policy build validation.
+pr:
+  branches:
+    include: [main]
+
+parameters:
+  - name: injectFault
+    displayName: 'Demo: ship a deliberately failing release to staging (must be rolled back)'
+    type: boolean
+    default: false
+  - name: faultRate
+    displayName: Fraction of order requests the faulty release fails
+    type: string
+    default: '0.3'
+  - name: skipInfra
+    displayName: Skip platform (Bicep) deployments
+    type: boolean
+    default: false
+  - name: allowProtectedChange
+    displayName: Allow changes to protected security properties (after security review)
+    type: boolean
+    default: false
+
+variables:
+  - template: variables/common.yml
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+  - stage: Build
+    displayName: Build & verify
+    jobs:
+      - template: templates/ci-jobs.yml
+
+  - stage: Dev
+    displayName: Dev
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    lockBehavior: sequential
+    jobs:
+      - template: templates/deploy-environment.yml
+        parameters:
+          environment: dev
+          serviceConnection: sc-tradeops-dev
+          pushImage: true
+          canarySteps: [100]   # blue/green: smoke at 0%, cut over, analyse, keep 'previous' warm
+          analysisRequests: 30
+          skipInfra: ${{ parameters.skipInfra }}
+          allowProtectedChange: ${{ parameters.allowProtectedChange }}
+
+  - stage: Staging
+    displayName: Staging (canary)
+    dependsOn: Dev
+    condition: succeeded()
+    lockBehavior: sequential
+    jobs:
+      - template: templates/deploy-environment.yml
+        parameters:
+          environment: staging
+          serviceConnection: sc-tradeops-staging
+          promoteFrom: dev
+          canarySteps: [10, 50]
+          skipInfra: ${{ parameters.skipInfra }}
+          allowProtectedChange: ${{ parameters.allowProtectedChange }}
+          ${{ if parameters.injectFault }}:
+            faultRate: ${{ parameters.faultRate }}
+
+  - stage: ProdPlan
+    displayName: Prod - change review
+    dependsOn: Staging
+    condition: succeeded()
+    jobs:
+      - job: WhatIf
+        displayName: Bicep what-if for the approver
+        steps:
+          - checkout: none
+          - download: current
+            artifact: deploy
+          - task: AzureCLI@2
+            displayName: what-if (no changes made)
+            inputs:
+              azureSubscription: sc-tradeops-prod
+              scriptType: pscore
+              scriptLocation: scriptPath
+              scriptPath: $(Pipeline.Workspace)/deploy/scripts/Deploy-Platform.ps1
+              arguments: >-
+                -Environment prod -WhatIfOnly
+                -TemplateFile $(Pipeline.Workspace)/deploy/infra/main.json
+                -ParameterFile $(Pipeline.Workspace)/deploy/infra/env/prod.parameters.json
+                -SummaryPath $(Pipeline.Workspace)/whatif-prod.md
+                -AllowProtectedChange:$${{ parameters.allowProtectedChange }}
+
+  # tradeops-prod carries the manual approval, business-hours window, main-branch-only
+  # check and exclusive lock (configured on the Azure DevOps environment).
+  - stage: Prod
+    displayName: Production (approval + canary)
+    dependsOn: ProdPlan
+    condition: succeeded()
+    lockBehavior: sequential
+    jobs:
+      - template: templates/deploy-environment.yml
+        parameters:
+          environment: prod
+          serviceConnection: sc-tradeops-prod
+          promoteFrom: staging
+          canarySteps: [10, 50]
+          analysisRequests: 100
+          maxErrorRatePct: '0.5'
+          maxP95Ms: 750
+          skipInfra: ${{ parameters.skipInfra }}
+          allowProtectedChange: ${{ parameters.allowProtectedChange }}

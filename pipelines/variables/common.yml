@@ -1,0 +1,18 @@
+# Pinned tool versions and naming shared by every stage. Changing a version here is a
+# reviewed change like any other.
+variables:
+  appVersion: '1.0.0'
+  imageRepository: tradeops
+  # Release identity, unique per run, used as the immutable registry tag.
+  releaseVersion: $(appVersion)-$(Build.BuildNumber)
+  # Revision suffix: unique per build and per stage attempt (a re-run gets a new revision).
+  revisionSuffix: r$(Build.BuildId)-$(System.StageAttempt)
+  pythonVersion: '3.12'
+  uvVersion: '0.11.1'
+  pesterVersion: '6.2.0'
+  psScriptAnalyzerVersion: '1.25.0'
+  psRuleVersion: '2.9.0'
+  psRuleAzureVersion: '1.47.0'
+  trivyImage: aquasec/trivy:0.58.1
+  gitleaksVersion: '8.21.2'
+  azuriteImage: mcr.microsoft.com/azure-storage/azurite:3.35.0

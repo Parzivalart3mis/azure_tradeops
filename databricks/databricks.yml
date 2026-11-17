@@ -1,0 +1,43 @@
+# Databricks bundle: synthetic settlement analytics for TradeOps.
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t staging
+#   databricks bundle run      -t staging tradeops_daily
+# The workspace host comes from DATABRICKS_HOST (the platform's databricksUrl output), so
+# this file holds no environment-specific endpoints.
+bundle:
+  name: tradeops-analytics
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for this environment
+  schema:
+    description: Schema holding the settlement tables
+    default: settlement
+  trades_per_run:
+    description: Synthetic trades generated per job run
+    default: 5000
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      catalog: tradeops_dev
+
+  staging:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: tradeops_staging
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: tradeops_prod
+      trades_per_run: 50000

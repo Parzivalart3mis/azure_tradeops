@@ -1,0 +1,56 @@
+# Deploys the Databricks bundle to one environment. Authentication is the environment's
+# federated service connection: the Databricks CLI reuses the Azure CLI session
+# (DATABRICKS_AUTH_TYPE=azure-cli), so no Databricks token exists anywhere.
+
+parameters:
+  - name: environment
+    type: string
+  - name: serviceConnection
+    type: string
+  - name: dependsOn
+    type: string
+  - name: runAfterDeploy
+    type: boolean
+    default: false
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: Databricks ${{ parameters.environment }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: Bundle
+        environment: tradeops-${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: |
+                    set -euo pipefail
+                    curl -sSL "https://github.com/databricks/cli/releases/download/v$(databricksCliVersion)/databricks_cli_$(databricksCliVersion)_linux_amd64.zip" -o /tmp/dbx.zip
+                    sudo unzip -o -q /tmp/dbx.zip databricks -d /usr/local/bin
+                    databricks --version
+                  displayName: Install Databricks CLI $(databricksCliVersion)
+
+                - task: AzureCLI@2
+                  displayName: bundle validate + deploy${{ iif(parameters.runAfterDeploy, ' + run', '') }}
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    workingDirectory: databricks
+                    inlineScript: |
+                      set -euo pipefail
+                      host=$(az deployment group show -g rg-tradeops-${{ parameters.environment }} -n tradeops-platform \
+                               --query properties.outputs.databricksUrl.value -o tsv)
+                      if [ -z "$host" ]; then
+                        echo "##vso[task.logissue type=error]Databricks is not deployed in ${{ parameters.environment }} (set deployDatabricks = true)"
+                        exit 1
+                      fi
+                      export DATABRICKS_HOST="https://$host" DATABRICKS_AUTH_TYPE=azure-cli
+                      databricks bundle validate -t ${{ parameters.environment }}
+                      databricks bundle deploy -t ${{ parameters.environment }}
+                      if [ "${{ parameters.runAfterDeploy }}" = "True" ]; then
+                        databricks bundle run -t ${{ parameters.environment }} tradeops_daily
+                      fi

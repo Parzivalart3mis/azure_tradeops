@@ -1,0 +1,132 @@
+# Mirror of the Azure Pipelines "Build & verify" stage, so the public GitHub repository shows
+# the same gates. Deployments run in Azure DevOps (pipelines/azure-pipelines.yml) only.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python - lint, types, tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start Azurite (Table Storage emulator)
+        run: docker run -d -p 10002:10002 mcr.microsoft.com/azure-storage/azurite:3.35.0 azurite-table --tableHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.1"
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy
+      - name: Unit + Azurite integration tests (coverage >= 90%)
+        run: uv run pytest -m "" --cov --cov-report=term --cov-fail-under=90
+        env:
+          TRADEOPS_TEST_AZURITE: "1"
+
+  app-security:
+    name: Security - SAST, dependencies, secrets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.1"
+      - name: bandit (fail on medium+)
+        working-directory: app
+        run: uv sync --frozen && uv run bandit -r src -c pyproject.toml --severity-level medium --confidence-level medium
+      - name: pip-audit
+        working-directory: app
+        run: |
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt > /tmp/requirements.txt
+          uv run pip-audit --strict --requirement /tmp/requirements.txt --progress-spinner off
+      - name: gitleaks (full history)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --redact --verbose
+
+  infrastructure:
+    name: Infrastructure - Bicep, PSRule, gate self-test
+    runs-on: ubuntu-24.04
+    env:
+      PSRULE_AZURE_BICEP_USE_AZURE_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bicep lint (rules raised to errors)
+        run: |
+          az bicep install
+          for f in infra/main.bicep infra/apps/api.bicep infra/apps/worker.bicep infra/governance/policies.bicep infra/bootstrap/main.bicep; do
+            az bicep lint --file "$f"
+          done
+          for e in dev staging prod; do az bicep build-params --file "infra/env/$e.bicepparam" --stdout > /dev/null; done
+      - name: PSRule for Azure
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSRule -RequiredVersion 2.9.0 -Scope CurrentUser -Force
+          Install-Module PSRule.Rules.Azure -RequiredVersion 1.47.0 -Scope CurrentUser -Force
+          Assert-PSRule -Format File -InputPath infra/ -Module PSRule.Rules.Azure
+      - name: Security gate self-test
+        shell: pwsh
+        run: ./scripts/Test-SecurityGates.ps1 -SummaryPath $env:GITHUB_STEP_SUMMARY
+
+  powershell:
+    name: PowerShell - analyzer, Pester
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          $findings = Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1
+          if ($findings) { $findings | Format-Table -AutoSize; throw 'PSScriptAnalyzer findings' }
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'scripts/tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
+  image:
+    name: Container image - build, Trivy
+    runs-on: ubuntu-24.04
+    needs: [python, app-security]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build app --build-arg VERSION=ci-${{ github.run_number }} --build-arg GIT_SHA=${{ github.sha }} -t tradeops:ci
+      - name: Trivy (fail on fixable HIGH/CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 \
+            image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed --no-progress tradeops:ci
+
+  databricks:
+    name: Databricks - Spark tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: databricks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.1"
+      - run: uv sync --frozen && uv run ruff check . && uv run pytest

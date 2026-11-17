@@ -1,0 +1,60 @@
+# PSRule for Azure: the PR-time infrastructure security gate.
+# Expands each environment's .bicepparam with its template, resolves parameters, then
+# evaluates every resource against the Azure Well-Architected baseline plus the TradeOps
+# rules in .ps-rule/. Any failure blocks the pull request.
+#
+#   pwsh -c "Assert-PSRule -Format File -InputPath infra/env/ -Module PSRule.Rules.Azure -Baseline TradeOps.Baseline"
+requires:
+  PSRule: '@pre >=2.9.0'
+  PSRule.Rules.Azure: '>=1.47.0'
+
+include:
+  module:
+    - PSRule.Rules.Azure
+
+# Bind type and name the same way PSRule for Azure does, so the TradeOps rules and
+# suppression groups in .ps-rule/ can select on Azure resource types.
+binding:
+  preferTargetInfo: true
+  targetType: [resourceType, type]
+  targetName: [resourceName, name]
+
+input:
+  pathIgnore:
+    - '**'
+    - '!infra/env/*.bicepparam'
+    - '!infra/apps/*.ci.bicepparam'
+
+configuration:
+  AZURE_BICEP_FILE_EXPANSION: true
+  AZURE_BICEP_PARAMS_FILE_EXPANSION: true
+  AZURE_BICEP_FILE_EXPANSION_TIMEOUT: 120
+  AZURE_DEPLOYMENT_NONSENSITIVE_PARAMETER_NAMES: []
+
+rule:
+  # TradeOps rules (.ps-rule/) always run, whatever baseline is selected.
+  includeLocal: true
+  # Accepted exceptions. Each is a deliberate trade-off recorded in docs/security.md;
+  # removing a line here re-enables the rule and the gate starts failing again.
+  exclude:
+    # Single-region design. Recovery is rebuild-from-source plus `az acr import`, and a
+    # second region would double the Premium registry and Service Bus cost.
+    - Azure.ACR.GeoReplica
+    - Azure.Log.Replication
+    # The order API is intentionally internet-facing (smoke tests and canary probes run
+    # from Microsoft-hosted agents). A real deployment would put an internal environment
+    # behind Application Gateway WAF and use a Managed DevOps Pool inside the VNet.
+    - Azure.ContainerApp.PublicAccess
+    - Azure.ContainerApp.RestrictIngress
+    # The Container Apps subnet keeps default outbound so the environment can pull images
+    # and reach Entra ID; the private-endpoint subnet does disable it. A NAT gateway or
+    # Azure Firewall egress is the production follow-up.
+    - Azure.VNET.PrivateSubnet
+
+output:
+  culture: ['en-US']
+
+execution:
+  # Fail when a template expands to nothing: a silently skipped file is not a pass.
+  noMatchingRules: Error
+  unprocessedObject: Warn

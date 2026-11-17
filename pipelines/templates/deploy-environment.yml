@@ -1,0 +1,170 @@
+# One environment's deployment: platform (Bicep what-if -> gate -> deploy), then the
+# progressive release of the build with automatic rollback.
+#
+# Both jobs are deployment jobs against the same Azure DevOps environment, so the
+# environment's checks (approvals, business hours, branch control, exclusive lock) apply
+# once, before anything runs. Azure access is a workload-identity-federated service
+# connection scoped to this environment's resource group: no secrets anywhere.
+
+parameters:
+  - name: environment         # dev | staging | prod
+    type: string
+  - name: serviceConnection
+    type: string
+  - name: promoteFrom         # registry the image is imported from ('' = already here)
+    type: string
+    default: ''
+  - name: pushImage           # dev only: push the CI-built image to the registry
+    type: boolean
+    default: false
+  - name: canarySteps         # traffic percentages analysed before promotion; [100] = blue/green
+    type: object
+    default: [10, 50]
+  - name: faultRate           # the failing-release demo sets this on staging
+    type: string
+    default: '0'
+  - name: analysisRequests
+    type: number
+    default: 60
+  - name: maxErrorRatePct
+    type: string
+    default: '1'
+  - name: maxP95Ms
+    type: number
+    default: 1000
+  - name: skipInfra
+    type: boolean
+    default: false
+  - name: allowProtectedChange  # set only after a security review of the what-if output
+    type: boolean
+    default: false
+
+jobs:
+  - deployment: Platform
+    displayName: Platform - what-if, gate, deploy (${{ parameters.environment }})
+    environment: tradeops-${{ parameters.environment }}
+    condition: and(succeeded(), eq('${{ parameters.skipInfra }}', 'False'))
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: current
+              artifact: deploy
+
+            - task: AzureCLI@2
+              displayName: Pre-flight environment validation
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                scriptType: pscore
+                scriptLocation: scriptPath
+                scriptPath: $(Pipeline.Workspace)/deploy/scripts/Test-Environment.ps1
+                arguments: -ResourceGroup rg-tradeops-${{ parameters.environment }}
+
+            - task: AzureCLI@2
+              displayName: Bicep what-if, change gate, deploy
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                scriptType: pscore
+                scriptLocation: scriptPath
+                scriptPath: $(Pipeline.Workspace)/deploy/scripts/Deploy-Platform.ps1
+                arguments: >-
+                  -Environment ${{ parameters.environment }}
+                  -TemplateFile $(Pipeline.Workspace)/deploy/infra/main.json
+                  -ParameterFile $(Pipeline.Workspace)/deploy/infra/env/${{ parameters.environment }}.parameters.json
+                  -SummaryPath $(Pipeline.Workspace)/whatif-${{ parameters.environment }}.md
+                  -AllowProtectedChange:$${{ parameters.allowProtectedChange }}
+
+  - deployment: Release
+    displayName: Release - canary, analyse, promote (${{ parameters.environment }})
+    dependsOn: Platform
+    condition: and(not(canceled()), in(dependencies.Platform.result, 'Succeeded', 'Skipped'))
+    environment: tradeops-${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: current
+              artifact: deploy
+            - ${{ if parameters.pushImage }}:
+                - download: current
+                  artifact: image
+
+            - task: AzureCLI@2
+              displayName: Pre-flight (platform must be healthy)
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                scriptType: pscore
+                scriptLocation: scriptPath
+                scriptPath: $(Pipeline.Workspace)/deploy/scripts/Test-Environment.ps1
+                arguments: -ResourceGroup rg-tradeops-${{ parameters.environment }} -RequirePlatform
+
+            - ${{ if parameters.pushImage }}:
+                - task: AzureCLI@2
+                  name: push
+                  displayName: Push image (immutable tag)
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: pscore
+                    scriptLocation: scriptPath
+                    scriptPath: $(Pipeline.Workspace)/deploy/scripts/Push-Image.ps1
+                    arguments: -ImageArchive $(Pipeline.Workspace)/image/tradeops.tar.gz -Tag $(releaseVersion)
+
+            - task: AzureCLI@2
+              name: release
+              displayName: Progressive release with automatic rollback
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                scriptType: pscore
+                scriptLocation: scriptPath
+                scriptPath: $(Pipeline.Workspace)/deploy/scripts/Deploy-Release.ps1
+                arguments: >-
+                  -Environment ${{ parameters.environment }}
+                  -Version $(releaseVersion)
+                  -RevisionSuffix $(revisionSuffix)
+                  -GitSha $(Build.SourceVersion)
+                  -PromoteFrom '${{ parameters.promoteFrom }}'
+                  -AppsTemplateDirectory $(Pipeline.Workspace)/deploy/infra/apps
+                  -Steps ${{ join(',', parameters.canarySteps) }}
+                  -FaultRate ${{ parameters.faultRate }}
+                  -AnalysisRequests ${{ parameters.analysisRequests }}
+                  -MaxErrorRatePct ${{ parameters.maxErrorRatePct }}
+                  -MaxP95Ms ${{ parameters.maxP95Ms }}
+                  -ReportPath $(Pipeline.Workspace)/reports/release-report-${{ parameters.environment }}.json
+
+            - task: AzureCLI@2
+              displayName: Post-promotion smoke test (public URL)
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                scriptType: pscore
+                scriptLocation: scriptPath
+                scriptPath: $(Pipeline.Workspace)/deploy/scripts/Invoke-SmokeTest.ps1
+                arguments: >-
+                  -Environment ${{ parameters.environment }}
+                  -ExpectedVersion $(releaseVersion)
+                  -ReportPath $(Pipeline.Workspace)/reports/smoke-${{ parameters.environment }}.json
+
+            - publish: $(Pipeline.Workspace)/reports
+              artifact: reports-${{ parameters.environment }}-$(System.StageAttempt)
+              condition: succeededOrFailed()
+
+        on:
+          failure:
+            steps:
+              - download: current
+                artifact: deploy
+              - task: AzureCLI@2
+                displayName: Rollback (idempotent safety net)
+                inputs:
+                  azureSubscription: ${{ parameters.serviceConnection }}
+                  scriptType: pscore
+                  scriptLocation: scriptPath
+                  scriptPath: $(Pipeline.Workspace)/deploy/scripts/Invoke-Rollback.ps1
+                  arguments: >-
+                    -Environment ${{ parameters.environment }}
+                    -Auto
+                    -Reason "pipeline failure in $(System.StageDisplayName), run $(Build.BuildNumber)"
+                    -ReleaseReportPath $(Pipeline.Workspace)/reports/release-report-${{ parameters.environment }}.json
+                    -ReportPath $(Pipeline.Workspace)/rollback/rollback-report-${{ parameters.environment }}.json
+              - publish: $(Pipeline.Workspace)/rollback
+                artifact: rollback-${{ parameters.environment }}-$(System.StageAttempt)
+                condition: succeededOrFailed()

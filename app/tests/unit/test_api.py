@@ -180,3 +180,30 @@ class TestSettingsAndLogging:
         assert line["message"] == "hello world"
         assert line["order_id"] == "o1"
         assert line["revision"] == "r1"
+
+
+def test_azure_monitor_uses_managed_identity_when_entra_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import azure.monitor.opentelemetry as distro
+
+    from tradeops.telemetry import configure_azure_monitor
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(distro, "configure_azure_monitor", lambda **kw: calls.append(kw))
+    monkeypatch.setenv("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001")
+
+    assert not configure_azure_monitor(Settings(), "tradeops-api")  # no connection string: off
+
+    settings = Settings(
+        applicationinsights_connection_string="InstrumentationKey=x;IngestionEndpoint=https://example",
+        appinsights_entra_auth=True,
+        revision="ca-tradeops-api-dev--r9",
+    )
+    assert configure_azure_monitor(settings, "tradeops-api")
+    (kwargs,) = calls
+    assert type(kwargs["credential"]).__name__ == "ManagedIdentityCredential"
+    attributes = kwargs["resource"].attributes  # type: ignore[attr-defined]
+    assert attributes["service.name"] == "tradeops-api"
+    assert attributes["service.version"] == "ca-tradeops-api-dev--r9"
+    assert kwargs["logger_name"] == "tradeops"

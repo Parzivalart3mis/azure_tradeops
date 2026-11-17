@@ -1,0 +1,62 @@
+# Databricks bundle CI/CD (optional Phase 4). Separate from the main pipeline because the
+# analytics workload has its own release cadence.
+#
+#   Validate (tests + bundle validate) -> Staging (deploy + run once) -> Prod (approval, deploy)
+#
+# Prerequisites: deployDatabricks = true in the environment's .bicepparam, and each
+# pipeline identity added to its Databricks workspace (docs/azure-devops-setup.md, "Optional: Databricks").
+
+name: dbx-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: ['databricks/*', 'pipelines/databricks-pipeline.yml']
+
+variables:
+  - template: variables/common.yml
+  - name: databricksCliVersion
+    value: '1.26.0'
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+  - stage: Validate
+    jobs:
+      - job: Test
+        displayName: Spark unit tests
+        steps:
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: $(pythonVersion) }
+          - script: |
+              set -euo pipefail
+              pip install --quiet "uv==$(uvVersion)"
+              uv sync --frozen
+              uv run ruff check .
+              uv run pytest --junitxml=$(Build.ArtifactStagingDirectory)/test-results-databricks.xml
+            displayName: ruff + pytest (local Spark on Java 21)
+            workingDirectory: databricks
+            env:
+              JAVA_HOME: $(JAVA_HOME_21_X64)
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Build.ArtifactStagingDirectory)/test-results-databricks.xml
+              testRunTitle: Databricks transforms
+
+  - template: templates/databricks-stage.yml
+    parameters:
+      environment: staging
+      serviceConnection: sc-tradeops-staging
+      dependsOn: Validate
+      runAfterDeploy: true
+
+  - template: templates/databricks-stage.yml
+    parameters:
+      environment: prod
+      serviceConnection: sc-tradeops-prod
+      dependsOn: Deploy_staging
+      runAfterDeploy: false

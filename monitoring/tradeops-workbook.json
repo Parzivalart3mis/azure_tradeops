@@ -1,0 +1,238 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "name": "header",
+      "content": {
+        "json": "## TradeOps operations\nOrder API and settlement worker health, split by Container Apps revision so a canary can be compared against the stable release side by side."
+      }
+    },
+    {
+      "type": 9,
+      "name": "parameters",
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "parameters": [
+          {
+            "id": "8f3c1c2e-3b1a-4c55-9a51-1f0b8f0f6d01",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "Time range",
+            "type": 4,
+            "isRequired": true,
+            "value": {
+              "durationMs": 3600000
+            },
+            "typeSettings": {
+              "selectableValues": [
+                {
+                  "durationMs": 900000
+                },
+                {
+                  "durationMs": 3600000
+                },
+                {
+                  "durationMs": 14400000
+                },
+                {
+                  "durationMs": 86400000
+                },
+                {
+                  "durationMs": 604800000
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppRequests\n| where AppRoleName == \"tradeops-api\" and Name !has \"healthz\" and Name !has \"readyz\"\n| extend revision = coalesce(tostring(Properties[\"tradeops.revision\"]), AppVersion)\n| summarize error_rate = round(100.0 * countif(toint(ResultCode) >= 500) / count(), 2) by revision, bin(TimeGenerated, 1m)\n| render timechart",
+        "size": 0,
+        "title": "API error rate by revision (%)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "timechart"
+      },
+      "customWidth": "50",
+      "name": "error-rate-by-revision"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppRequests\n| where AppRoleName == \"tradeops-api\" and Name !has \"healthz\" and Name !has \"readyz\"\n| extend revision = coalesce(tostring(Properties[\"tradeops.revision\"]), AppVersion)\n| summarize requests = count() by revision",
+        "size": 0,
+        "title": "Requests served per revision (live traffic split)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "piechart"
+      },
+      "customWidth": "50",
+      "name": "traffic-split"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppRequests\n| where AppRoleName == \"tradeops-api\" and Name startswith \"POST /v1/orders\"\n| summarize p50 = percentile(DurationMs, 50), p95 = percentile(DurationMs, 95), p99 = percentile(DurationMs, 99) by bin(TimeGenerated, 1m)\n| render timechart",
+        "size": 0,
+        "title": "Order submission latency (ms)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "timechart"
+      },
+      "customWidth": "50",
+      "name": "latency"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name in (\"tradeops.orders.received\", \"tradeops.orders.rejected\", \"tradeops.transactions.settled\", \"tradeops.transactions.failed\")\n| summarize count = sum(Sum) by Name, bin(TimeGenerated, 5m)\n| render columnchart",
+        "size": 0,
+        "title": "Order outcomes",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "barchart"
+      },
+      "customWidth": "50",
+      "name": "order-outcomes"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"tradeops.orders.rejected\"\n| extend reason = tostring(Properties[\"reason\"])\n| summarize rejected = sum(Sum) by reason\n| order by rejected desc",
+        "size": 0,
+        "title": "Pre-trade risk rejections by reason",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "table"
+      },
+      "customWidth": "50",
+      "name": "rejections"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"tradeops.settlement.latency\"\n| summarize avg_ms = sum(Sum) / sum(ItemCount), max_ms = max(Max) by bin(TimeGenerated, 5m)\n| render timechart",
+        "size": 0,
+        "title": "Settlement latency, accept to settled (ms)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "timechart"
+      },
+      "customWidth": "50",
+      "name": "settlement-latency"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AzureMetrics\n| where ResourceProvider == \"MICROSOFT.SERVICEBUS\" and MetricName in (\"DeadletteredMessages\", \"ActiveMessages\")\n| summarize value = max(Maximum) by MetricName, bin(TimeGenerated, 5m)\n| render timechart",
+        "size": 0,
+        "title": "Settlement dead-letter queue depth",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "timechart"
+      },
+      "customWidth": "50",
+      "name": "dead-letters"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where AppRoleName startswith \"tradeops\"\n| summarize calls = count(), failed = countif(Success == false), p95_ms = percentile(DurationMs, 95) by Target, DependencyType\n| order by calls desc",
+        "size": 0,
+        "title": "Dependency calls (Table Storage, Service Bus)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "table"
+      },
+      "customWidth": "50",
+      "name": "dependencies"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "ContainerAppSystemLogs\n| where ContainerAppName startswith \"ca-tradeops\"\n| project TimeGenerated, ContainerAppName, RevisionName, Reason, Log\n| order by TimeGenerated desc\n| take 100",
+        "size": 0,
+        "title": "Container Apps platform events (restarts, probes, scaling)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "table"
+      },
+      "customWidth": "100",
+      "name": "platform-events"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "ContainerAppConsoleLogs\n| where ContainerAppName startswith \"ca-tradeops\"\n| extend entry = parse_json(Log)\n| where tostring(entry.level) in (\"ERROR\", \"CRITICAL\")\n| project TimeGenerated, RevisionName, message = tostring(entry.message), order_id = tostring(entry.order_id), error = tostring(entry.error), trace_id = tostring(entry.trace_id)\n| order by TimeGenerated desc\n| take 100",
+        "size": 0,
+        "title": "Recent application errors (structured logs)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "__WORKSPACE_ID__"
+        ],
+        "visualization": "table"
+      },
+      "customWidth": "100",
+      "name": "recent-errors"
+    }
+  ],
+  "fallbackResourceIds": [
+    "__WORKSPACE_ID__"
+  ],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

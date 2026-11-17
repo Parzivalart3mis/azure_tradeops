@@ -1,0 +1,49 @@
+# Environment-scoped exceptions. Production gets no suppressions: every rule applies.
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: SuppressionGroup
+metadata:
+  name: TradeOps.Dev.Ephemeral
+spec:
+  displayName: Dev is disposable and cost-minimised
+  description: >-
+    Dev is torn down and recreated freely. Purge protection would reserve the Key Vault
+    name for the retention period after teardown, and zone- or geo-redundant storage buys
+    nothing for synthetic data.
+  rule:
+    - Azure.KeyVault.PurgeProtect
+    - Azure.Storage.UseReplication
+  if:
+    field: tags.environment
+    equals: dev
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: SuppressionGroup
+metadata:
+  name: TradeOps.NonProd.RegistrySku
+spec:
+  displayName: Registry export policy needs Premium
+  description: >-
+    The export policy can only be disabled on Premium registries. Dev and staging use
+    Standard; prod is Premium with export disabled and public access off, which
+    TradeOps.Prod.PrivateNetworking enforces.
+  rule:
+    - Azure.ACR.ExportPolicy
+  if:
+    field: tags.environment
+    in: [dev, staging]
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: SuppressionGroup
+metadata:
+  name: TradeOps.NonProd.Capacity
+spec:
+  displayName: Non-production runs a single replica
+  description: >-
+    Dev and staging keep one replica to control cost; the canary path is still exercised
+    end to end. Prod runs at least two replicas across zones (infra/env/prod.bicepparam).
+  rule:
+    - Azure.ContainerApp.MinReplicas
+  if:
+    field: tags.environment
+    in: [dev, staging]

@@ -1,0 +1,169 @@
+# TradeOps organisation rules, evaluated alongside the PSRule for Azure baseline.
+# Each mirrors a control in docs/security.md; several also exist as Azure Policy (Deny) in
+# infra/governance so they are enforced at deploy time as well as at review time.
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.Tags.Required
+  displayName: Required governance tags
+spec:
+  level: Error
+  recommend: Tag every resource with costCenter, owner and dataClassification.
+  with: [TradeOps.IsTopLevelResource]
+  condition:
+    allOf:
+      - field: tags.costCenter
+        hasValue: true
+      - field: tags.owner
+        hasValue: true
+      - field: tags.dataClassification
+        in: [public, internal, confidential]
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Selector
+metadata:
+  name: TradeOps.IsTopLevelResource
+spec:
+  if:
+    allOf:
+      - field: type
+        in:
+          - Microsoft.Storage/storageAccounts
+          - Microsoft.KeyVault/vaults
+          - Microsoft.ContainerRegistry/registries
+          - Microsoft.ServiceBus/namespaces
+          - Microsoft.App/managedEnvironments
+          - Microsoft.App/containerApps
+          - Microsoft.Network/virtualNetworks
+          - Microsoft.Network/networkSecurityGroups
+          - Microsoft.OperationalInsights/workspaces
+          - Microsoft.Insights/components
+          - Microsoft.ManagedIdentity/userAssignedIdentities
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.Storage.NoSharedKey
+  displayName: Storage is Entra ID only
+spec:
+  level: Error
+  recommend: Set allowSharedKeyAccess to false; workloads use managed identity.
+  type: [Microsoft.Storage/storageAccounts]
+  condition:
+    field: properties.allowSharedKeyAccess
+    equals: false
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.ServiceBus.NoLocalAuth
+  displayName: Service Bus is Entra ID only
+spec:
+  level: Error
+  recommend: Set disableLocalAuth to true; SAS keys must not exist.
+  type: [Microsoft.ServiceBus/namespaces]
+  condition:
+    field: properties.disableLocalAuth
+    equals: true
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.ServiceBus.DuplicateDetection
+  displayName: Settlement queues de-duplicate
+spec:
+  level: Error
+  recommend: Enable requiresDuplicateDetection so a retried publish cannot settle twice.
+  type: [Microsoft.ServiceBus/namespaces]
+  # Queues are expanded as child resources of the namespace.
+  condition:
+    field: resources
+    where:
+      field: type
+      equals: Microsoft.ServiceBus/namespaces/queues
+    allOf:
+      - field: properties.requiresDuplicateDetection
+        equals: true
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.KeyVault.RbacOnly
+  displayName: Key Vault uses RBAC
+spec:
+  level: Error
+  recommend: Set enableRbacAuthorization to true; access policies are not allowed.
+  type: [Microsoft.KeyVault/vaults]
+  condition:
+    field: properties.enableRbacAuthorization
+    equals: true
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.Monitor.NoLocalAuth
+  displayName: Telemetry ingestion requires Entra ID
+spec:
+  level: Error
+  recommend: Set DisableLocalAuth on Application Insights and disableLocalAuth on the workspace.
+  type: [Microsoft.Insights/components, Microsoft.OperationalInsights/workspaces]
+  condition:
+    anyOf:
+      - field: properties.DisableLocalAuth
+        equals: true
+      - field: properties.features.disableLocalAuth
+        equals: true
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.Prod.PrivateNetworking
+  displayName: Production PaaS is private
+spec:
+  level: Error
+  recommend: In prod, disable public network access on Key Vault, Storage, Service Bus and ACR.
+  type:
+    - Microsoft.KeyVault/vaults
+    - Microsoft.Storage/storageAccounts
+    - Microsoft.ServiceBus/namespaces
+    - Microsoft.ContainerRegistry/registries
+  where:
+    field: tags.environment
+    equals: prod
+  condition:
+    field: properties.publicNetworkAccess
+    equals: Disabled
+---
+apiVersion: github.com/microsoft/PSRule/v1
+kind: Rule
+metadata:
+  name: TradeOps.NSG.NoInternetManagementPorts
+  displayName: No management ports from the internet
+spec:
+  level: Error
+  recommend: >-
+    Never allow SSH, RDP or WinRM inbound from Internet, Any or 0.0.0.0/0. Added after the
+    security-gate self-test showed the built-in rules miss the Internet service tag.
+  type: [Microsoft.Network/networkSecurityGroups]
+  condition:
+    field: properties.securityRules
+    where:
+      allOf:
+        - field: properties.direction
+          equals: Inbound
+        - field: properties.access
+          equals: Allow
+        - field: properties.sourceAddressPrefix
+          in: ['*', 'Internet', 'Any', '0.0.0.0/0']
+    allOf:
+      - anyOf:
+          - field: properties.destinationPortRange
+            hasValue: false
+          - field: properties.destinationPortRange
+            notIn: ['*', '22', '3389', '5985', '5986']
+      - anyOf:
+          - field: properties.destinationPortRanges
+            hasValue: false
+          - field: properties.destinationPortRanges
+            notIn: ['*', '22', '3389', '5985', '5986']

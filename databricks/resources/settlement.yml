@@ -1,0 +1,51 @@
+resources:
+  volumes:
+    landing:
+      catalog_name: ${var.catalog}
+      schema_name: ${var.schema}
+      name: landing
+      comment: Raw synthetic trade files (JSON lines)
+
+  pipelines:
+    tradeops_settlement:
+      name: tradeops-settlement-${bundle.target}
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      photon: true
+      channel: CURRENT
+      libraries:
+        - file:
+            path: ../src/tradeops_analytics/settlement_pipeline.py
+      configuration:
+        tradeops.landing_path: /Volumes/${var.catalog}/${var.schema}/landing/trades
+        tradeops.concentration_limit: "0.25"
+
+  jobs:
+    tradeops_daily:
+      name: tradeops-daily-${bundle.target}
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 30 18 ? * MON-FRI"
+        timezone_id: America/New_York
+        pause_status: PAUSED
+      tasks:
+        - task_key: generate_trades
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/tradeops_analytics/generate_trades.py
+            parameters:
+              - --output
+              - /Volumes/${var.catalog}/${var.schema}/landing/trades
+              - --count
+              - "${var.trades_per_run}"
+        - task_key: refresh_settlement
+          depends_on:
+            - task_key: generate_trades
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.tradeops_settlement.id}
+            full_refresh: false
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"

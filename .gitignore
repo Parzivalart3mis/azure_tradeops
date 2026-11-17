@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+test-results*.xml
+*.egg-info/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Infra build output
+infra/**/*.json
+!infra/bicepconfig.json
+!monitoring/*.json
+reports/
+whatif-*.md
+release-report*.json
+rollback-report*.json
+smoke-*.json
+security-gates.md
+
+# Databricks
+databricks/.databricks/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

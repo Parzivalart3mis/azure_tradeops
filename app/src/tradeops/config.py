@@ -60,6 +60,9 @@ class Settings(BaseSettings):
 
     readiness_timeout_s: float = Field(default=2.0, gt=0)
 
+    # Application Insights has local auth disabled in Azure (infra/modules/monitoring.bicep),
+    # so ingestion authenticates with the app's managed identity.
+    appinsights_entra_auth: bool = False
     applicationinsights_connection_string: SecretStr | None = Field(
         default=None,
         validation_alias=AliasChoices(
